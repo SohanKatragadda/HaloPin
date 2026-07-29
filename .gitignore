@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager and compiler caches
+.build/
+.swiftpm/
+
+# Xcode user data and build products
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Locally packaged release artifacts
+outputs/
+
+# Temporary packaging workspace
+work/
