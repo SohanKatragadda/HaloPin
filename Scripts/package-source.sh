@@ -13,6 +13,7 @@ cd "${PROJECT_DIR}"
     Tests \
     Configuration \
     Scripts \
+    INSTALLATION_GUIDE.md \
     README.md \
     PERFORMANCE.md \
     PRIVACY.md \
