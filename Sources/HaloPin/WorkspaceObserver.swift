@@ -78,6 +78,18 @@ final class WorkspaceObserver: WorkspaceObserving {
         }
     }
 
+    func stop() {
+        guard isStarted else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceTokens.forEach(center.removeObserver)
+        workspaceTokens.removeAll(keepingCapacity: true)
+        if let displayToken {
+            NotificationCenter.default.removeObserver(displayToken)
+        }
+        displayToken = nil
+        isStarted = false
+    }
+
     private func observeApplication(
         _ name: Notification.Name,
         center: NotificationCenter,

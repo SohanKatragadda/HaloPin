@@ -25,6 +25,7 @@ fi
 /bin/mkdir -p "${STAGING_DIR}/Documentation"
 for document in \
     README.md \
+    PERFORMANCE.md \
     PRIVACY.md \
     PERMISSIONS.md \
     TROUBLESHOOTING.md \

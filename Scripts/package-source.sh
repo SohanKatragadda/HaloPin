@@ -14,6 +14,7 @@ cd "${PROJECT_DIR}"
     Configuration \
     Scripts \
     README.md \
+    PERFORMANCE.md \
     PRIVACY.md \
     PERMISSIONS.md \
     TROUBLESHOOTING.md \

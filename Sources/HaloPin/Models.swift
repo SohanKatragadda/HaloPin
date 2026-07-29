@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
@@ -26,6 +27,7 @@ enum PinState: Equatable {
              (.becomingPassive, .terminating),
              (.becomingPassive, .failed),
              (.passive, .handingOff),
+             (.passive, .interactive),
              (.passive, .terminating),
              (.passive, .failed),
              (.handingOff, .interactive),
@@ -45,6 +47,81 @@ enum CrossSpaceCaptureState: Equatable {
     case recovering
     case offSpaceAwaitingChoice
     case pausedOffSpace
+}
+
+enum CaptureProfile: Equatable {
+    case warm
+    case live
+
+    var minimumFrameInterval: CMTime {
+        switch self {
+        case .warm:
+            CMTime(seconds: 1, preferredTimescale: 600)
+        case .live:
+            CMTime(value: 1, timescale: 30)
+        }
+    }
+
+    var queueDepth: Int {
+        switch self {
+        case .warm: 1
+        case .live: 2
+        }
+    }
+
+    func outputPixelSize(for pointSize: CGSize, scale: CGFloat) -> CGSize {
+        let native = CGSize(
+            width: max(2, pointSize.width * scale),
+            height: max(2, pointSize.height * scale)
+        )
+        guard self == .warm else { return native }
+
+        let longestEdge = max(native.width, native.height)
+        guard longestEdge > 1_280 else { return native }
+        let reduction = 1_280 / longestEdge
+        return CGSize(
+            width: max(2, (native.width * reduction).rounded(.down)),
+            height: max(2, (native.height * reduction).rounded(.down))
+        )
+    }
+}
+
+enum CaptureHealth: Equatable, Sendable {
+    case healthy
+    case stalled
+    case stopped
+}
+
+enum CaptureLifecycleMode: Equatable {
+    case stopped
+    case initial
+    case warm
+    case live
+    case stoppedPreservingFrame
+}
+
+struct SessionTiming: Equatable {
+    var initialFrameValidationTimeout: Duration = .seconds(2)
+    var captureRefreshFrameTimeout: Duration = .seconds(1)
+    var captureConfigurationFrameWait: Duration = .milliseconds(180)
+    var passiveFrameWait: Duration = .milliseconds(120)
+    var geometrySettleTimeout: Duration = .milliseconds(120)
+    var geometryPollInterval: Duration = .milliseconds(16)
+    var interactiveGeometryDebounce: Duration = .milliseconds(80)
+    var handoffPollInterval: Duration = .milliseconds(50)
+    var handoffActivationTimeout: Duration = .milliseconds(2_500)
+    var handoffRetryTimeout: Duration = .milliseconds(500)
+    var spaceRecoveryDebounce: Duration = .milliseconds(180)
+    var spaceTransitionSettleTimeout: Duration = .milliseconds(300)
+    var spaceStatePollInterval: Duration = .milliseconds(25)
+    var availabilityPollInterval: Duration = .milliseconds(100)
+    var availabilityPollTimeout: Duration = .seconds(1)
+    var windowIdentityRetryDelay: Duration = .milliseconds(180)
+    var windowIdentityRetryCount = 3
+    var captureStallTimeout: Duration = .milliseconds(1_500)
+    var captureRecoveryCooldown: Duration = .seconds(2)
+
+    static let production = SessionTiming()
 }
 
 enum SourceWindowAvailability: Equatable {

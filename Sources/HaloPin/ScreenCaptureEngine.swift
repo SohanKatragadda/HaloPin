@@ -1,3 +1,4 @@
+import AppKit
 @preconcurrency import AVFoundation
 @preconcurrency import CoreMedia
 import CoreVideo
@@ -15,81 +16,99 @@ final class ScreenCaptureEngine:
 
     private let outputQueue = DispatchQueue(
         label: "com.halopin.capture.frames",
-        qos: .userInteractive
+        qos: .userInitiated
     )
-    nonisolated(unsafe) private var stream: SCStream?
-    @MainActor private var hasReceivedCompleteFrame = false
-    @MainActor private var completeFrameSequence: UInt64 = 0
+    private let activity = CaptureActivityTracker()
+    private let timing: SessionTiming
+
+    @MainActor private var stream: SCStream?
+    @MainActor private var healthTask: Task<Void, Never>?
     @MainActor private var configuredPixelSize: CGSize?
     @MainActor private var configuredSourceRect: CGRect?
+    @MainActor private var configuredProfile: CaptureProfile?
     @MainActor private var captureDisplayFrame: CGRect?
 
-    @MainActor var onSampleHeartbeat: (() -> Void)?
-    @MainActor var onCompleteFrame: (() -> Void)?
+    @MainActor var onHealthChanged: ((CaptureHealth) -> Void)?
     @MainActor var onFailure: ((Error) -> Void)?
 
-    override init() {
+    init(timing: SessionTiming = .production) {
+        self.timing = timing
         super.init()
         displayLayer.videoGravity = .resizeAspect
         displayLayer.backgroundColor = CGColor.black
     }
 
     @MainActor
-    func start(window: CaptureWindowReference) async throws {
-        await stop()
-        hasReceivedCompleteFrame = false
+    func start(
+        window: CaptureWindowReference,
+        profile: CaptureProfile
+    ) async throws {
+        await stop(preserveDisplayedFrame: false)
         guard let screenCaptureWindow = window.screenCaptureWindow else {
             throw PinFailure.windowMappingFailed
         }
         try await installStream(
             window: screenCaptureWindow,
             frame: window.frame,
-            display: nil
+            display: nil,
+            profile: profile
         )
     }
 
     @MainActor
-    func refresh(window: CaptureWindowReference, frame: CGRect) async throws {
+    func refresh(
+        window: CaptureWindowReference,
+        frame: CGRect,
+        profile: CaptureProfile
+    ) async throws {
         guard let screenCaptureWindow = window.screenCaptureWindow else {
             throw PinFailure.windowMappingFailed
         }
-        // A stream may keep producing nominally complete frames while its
-        // desktop-independent window remains bound to an old Space surface.
-        // Recreate the stream on every explicit rebind instead of treating
-        // frame count alone as proof that the source surface is current.
-        let baseline = completeFrameSequence
         try await restartPreservingDisplayedFrame(
             window: screenCaptureWindow,
             frame: frame,
-            display: window.screenCaptureDisplay
+            display: window.screenCaptureDisplay,
+            profile: profile
         )
-        guard await waitForCompleteFrames(
-            after: baseline,
+        let snapshot = activity.snapshot()
+        guard await activity.waitForAdvance(
+            after: snapshot.generationStartSequence,
+            generation: snapshot.generation,
             count: 1,
-            timeout: .seconds(1)
+            timeout: timing.captureRefreshFrameTimeout
         ) else {
             throw PinFailure.captureFailed
         }
     }
 
     @MainActor
-    func resize(to frame: CGRect) async throws {
+    func update(frame: CGRect, profile: CaptureProfile) async throws {
         guard let stream else { return }
-        let baseline = completeFrameSequence
-        let changed = try await updateConfigurationIfNeeded(stream: stream, frame: frame)
-        if changed {
-            _ = await waitForCompleteFrames(
-                after: baseline,
+        let baseline = activity.snapshot()
+        let changed = try await updateConfigurationIfNeeded(
+            stream: stream,
+            frame: frame,
+            profile: profile
+        )
+        if changed, profile == .live {
+            _ = await activity.waitForAdvance(
+                after: baseline.sequence,
+                generation: baseline.generation,
                 count: 1,
-                timeout: .milliseconds(180)
+                timeout: timing.captureConfigurationFrameWait
             )
         }
     }
 
     @MainActor
-    func awaitCompleteFrameAdvance(count: UInt64, timeout: Duration) async -> Bool {
-        await waitForCompleteFrames(
-            after: completeFrameSequence,
+    func awaitCompleteFrameAdvance(
+        count: UInt64,
+        timeout: Duration
+    ) async -> Bool {
+        let baseline = activity.snapshot()
+        return await activity.waitForAdvance(
+            after: baseline.sequence,
+            generation: baseline.generation,
             count: count,
             timeout: timeout
         )
@@ -97,53 +116,84 @@ final class ScreenCaptureEngine:
 
     @MainActor
     func validateInitialFrame(timeout: Duration = .seconds(2)) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if displayLayer.isOutputObscuredDueToInsufficientExternalProtection {
-                throw PinFailure.protectedContent
-            }
-            if hasReceivedCompleteFrame {
-                return
-            }
-            try await Task.sleep(for: .milliseconds(25))
+        let snapshot = activity.snapshot()
+        let receivedFrame = await activity.waitForAdvance(
+            after: snapshot.generationStartSequence,
+            generation: snapshot.generation,
+            count: 1,
+            timeout: timeout
+        )
+        if displayLayer.isOutputObscuredDueToInsufficientExternalProtection {
+            throw PinFailure.protectedContent
         }
-        throw PinFailure.captureFailed
+        guard receivedFrame else {
+            throw PinFailure.captureFailed
+        }
     }
 
     @MainActor
-    func stop() async {
-        guard let stream else {
-            await displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true)
-            configuredPixelSize = nil
-            configuredSourceRect = nil
-            captureDisplayFrame = nil
-            return
+    func setHealthMonitoring(enabled: Bool, stallTimeout: Duration) {
+        healthTask?.cancel()
+        healthTask = nil
+        if let transition = activity.setMonitoring(enabled: enabled) {
+            onHealthChanged?(transition)
         }
-        self.stream = nil
+        guard enabled else { return }
+
+        let activity = activity
+        healthTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let remaining = activity.remainingUntilStall(
+                    timeout: stallTimeout
+                ) else {
+                    return
+                }
+                if remaining > .zero {
+                    try? await Task.sleep(for: remaining)
+                    if Task.isCancelled { return }
+                }
+                if let transition = activity.markStalledIfNeeded(
+                    timeout: stallTimeout
+                ) {
+                    self?.onHealthChanged?(transition)
+                } else if remaining == .zero {
+                    try? await Task.sleep(for: stallTimeout)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func stop(preserveDisplayedFrame: Bool) async {
+        healthTask?.cancel()
+        healthTask = nil
+        if let transition = activity.invalidate() {
+            onHealthChanged?(transition)
+        }
+
+        let previousStream = stream
+        stream = nil
         configuredPixelSize = nil
         configuredSourceRect = nil
+        configuredProfile = nil
         captureDisplayFrame = nil
-        do {
-            try await stream.stopCapture()
-        } catch {
-            // Cleanup must be idempotent; the stream may already have stopped.
+        if let previousStream {
+            try? await previousStream.stopCapture()
         }
-        await displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true)
+        await displayLayer.sampleBufferRenderer.flush(
+            removingDisplayedImage: !preserveDisplayedFrame
+        )
     }
 
     @MainActor
     private func installStream(
         window: SCWindow,
         frame: CGRect,
-        display: SCDisplay?
+        display: SCDisplay?,
+        profile: CaptureProfile
     ) async throws {
         let filter: SCContentFilter
         if let display {
-            // A desktop-independent filter can remain connected to the
-            // original Space's backing surface even after an All Desktops
-            // window appears elsewhere. A display-scoped single-window filter
-            // instead binds to the composited instance on the current Space.
             filter = SCContentFilter(display: display, including: [window])
             captureDisplayFrame = display.frame
         } else {
@@ -152,7 +202,8 @@ final class ScreenCaptureEngine:
         }
         let configuration = Self.configuration(
             for: frame,
-            displayFrame: captureDisplayFrame
+            displayFrame: captureDisplayFrame,
+            profile: profile
         )
         configuredPixelSize = CGSize(
             width: configuration.width,
@@ -164,6 +215,7 @@ final class ScreenCaptureEngine:
                 displayFrame: $0
             )
         }
+        configuredProfile = profile
 
         let newStream = SCStream(
             filter: filter,
@@ -175,6 +227,7 @@ final class ScreenCaptureEngine:
             type: .screen,
             sampleHandlerQueue: outputQueue
         )
+        activity.begin(streamID: ObjectIdentifier(newStream))
         stream = newStream
         do {
             try await newStream.startCapture()
@@ -182,6 +235,10 @@ final class ScreenCaptureEngine:
             if stream === newStream {
                 stream = nil
                 configuredPixelSize = nil
+                configuredSourceRect = nil
+                configuredProfile = nil
+                captureDisplayFrame = nil
+                _ = activity.invalidate()
             }
             throw error
         }
@@ -191,34 +248,40 @@ final class ScreenCaptureEngine:
     private func restartPreservingDisplayedFrame(
         window: SCWindow,
         frame: CGRect,
-        display: SCDisplay?
+        display: SCDisplay?,
+        profile: CaptureProfile
     ) async throws {
         let previousStream = stream
         stream = nil
         configuredPixelSize = nil
         configuredSourceRect = nil
+        configuredProfile = nil
         captureDisplayFrame = nil
-        hasReceivedCompleteFrame = false
+        _ = activity.invalidate()
         if let previousStream {
             try? await previousStream.stopCapture()
         }
-        // A replacement SCStream may start its presentation timeline before the
-        // previous stream's final timestamp. Reset the renderer queue/timing
-        // state while retaining the last displayed image during recovery.
         await displayLayer.sampleBufferRenderer.flush(
             removingDisplayedImage: false
         )
-        try await installStream(window: window, frame: frame, display: display)
+        try await installStream(
+            window: window,
+            frame: frame,
+            display: display,
+            profile: profile
+        )
     }
 
     @MainActor
     private func updateConfigurationIfNeeded(
         stream: SCStream,
-        frame: CGRect
+        frame: CGRect,
+        profile: CaptureProfile
     ) async throws -> Bool {
         let configuration = Self.configuration(
             for: frame,
-            displayFrame: captureDisplayFrame
+            displayFrame: captureDisplayFrame,
+            profile: profile
         )
         let requestedPixelSize = CGSize(
             width: configuration.width,
@@ -231,29 +294,15 @@ final class ScreenCaptureEngine:
             )
         }
         guard requestedPixelSize != configuredPixelSize
-                || requestedSourceRect != configuredSourceRect else {
+                || requestedSourceRect != configuredSourceRect
+                || profile != configuredProfile else {
             return false
         }
         try await stream.updateConfiguration(configuration)
         configuredPixelSize = requestedPixelSize
         configuredSourceRect = requestedSourceRect
+        configuredProfile = profile
         return true
-    }
-
-    @MainActor
-    private func waitForCompleteFrames(
-        after baseline: UInt64,
-        count: UInt64,
-        timeout: Duration
-    ) async -> Bool {
-        let targetSequence = baseline &+ count
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while completeFrameSequence < targetSequence, clock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(8))
-            if Task.isCancelled { return false }
-        }
-        return completeFrameSequence >= targetSequence
     }
 
     nonisolated func stream(
@@ -276,33 +325,37 @@ final class ScreenCaptureEngine:
             return
         }
 
-        guard stream === self.stream else { return }
         let disposition = Self.disposition(for: status)
         if disposition == .complete {
             Self.markForImmediateDisplay(sampleBuffer)
-            displayLayer.sampleBufferRenderer.enqueue(sampleBuffer)
         }
-
-        Task { @MainActor [weak self] in
-            guard let self, stream === self.stream else { return }
-            switch disposition {
-            case .complete:
-                self.onSampleHeartbeat?()
-                self.completeFrameSequence &+= 1
-                self.hasReceivedCompleteFrame = true
-                self.onCompleteFrame?()
-            case .heartbeatOnly:
-                self.onSampleHeartbeat?()
-            case .ignored:
-                break
+        let streamID = ObjectIdentifier(stream)
+        let transition = activity.process(
+            streamID: streamID,
+            disposition: disposition
+        ) {
+            if disposition == .complete {
+                displayLayer.sampleBufferRenderer.enqueue(sampleBuffer)
+            }
+        }
+        if let transition {
+            Task { @MainActor [weak self] in
+                guard self?.activity.isCurrent(streamID: streamID) == true else {
+                    return
+                }
+                self?.onHealthChanged?(transition)
             }
         }
     }
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let streamID = ObjectIdentifier(stream)
+        guard activity.isCurrent(streamID: streamID) else { return }
         Task { @MainActor [weak self] in
-            guard let self, stream === self.stream else { return }
-            self.onFailure?(error)
+            guard self?.activity.isCurrent(streamID: streamID) == true else {
+                return
+            }
+            self?.onFailure?(error)
         }
     }
 
@@ -367,13 +420,16 @@ final class ScreenCaptureEngine:
     @MainActor
     private static func configuration(
         for frame: CGRect,
-        displayFrame: CGRect?
+        displayFrame: CGRect?,
+        profile: CaptureProfile
     ) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.colorSpaceName = CGColorSpace.sRGB
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        configuration.queueDepth = 3
+        configuration.minimumFrameInterval = profile.minimumFrameInterval
+        configuration.queueDepth = profile.queueDepth
+        configuration.scalesToFit = true
+        configuration.preservesAspectRatio = true
         configuration.showsCursor = false
         configuration.capturesAudio = false
         if let displayFrame {
@@ -383,9 +439,12 @@ final class ScreenCaptureEngine:
             )
         }
 
-        let scale = backingScale(for: frame)
-        configuration.width = max(2, Int(frame.width * scale))
-        configuration.height = max(2, Int(frame.height * scale))
+        let pixelSize = profile.outputPixelSize(
+            for: frame.size,
+            scale: backingScale(for: frame)
+        )
+        configuration.width = max(2, Int(pixelSize.width))
+        configuration.height = max(2, Int(pixelSize.height))
         return configuration
     }
 }

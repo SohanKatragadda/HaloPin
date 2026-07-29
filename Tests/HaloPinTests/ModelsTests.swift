@@ -1,9 +1,38 @@
 import CoreGraphics
 import Carbon
+import CoreMedia
 import XCTest
 @testable import HaloPin
 
 final class ModelsTests: XCTestCase {
+    func testCaptureProfilesBalanceWarmEfficiencyAndLiveQuality() {
+        XCTAssertEqual(CaptureProfile.warm.queueDepth, 1)
+        XCTAssertEqual(CaptureProfile.live.queueDepth, 2)
+        XCTAssertEqual(
+            CaptureProfile.warm.minimumFrameInterval,
+            CMTime(seconds: 1, preferredTimescale: 600)
+        )
+        XCTAssertEqual(
+            CaptureProfile.live.minimumFrameInterval,
+            CMTime(value: 1, timescale: 30)
+        )
+
+        XCTAssertEqual(
+            CaptureProfile.live.outputPixelSize(
+                for: CGSize(width: 1_200, height: 800),
+                scale: 2
+            ),
+            CGSize(width: 2_400, height: 1_600)
+        )
+        XCTAssertEqual(
+            CaptureProfile.warm.outputPixelSize(
+                for: CGSize(width: 1_200, height: 800),
+                scale: 2
+            ),
+            CGSize(width: 1_280, height: 853)
+        )
+    }
+
     func testPinStateHappyPath() {
         XCTAssertTrue(PinState.resolving.canTransition(to: .interactive))
         XCTAssertTrue(PinState.interactive.canTransition(to: .becomingPassive))
@@ -15,7 +44,7 @@ final class ModelsTests: XCTestCase {
 
     func testPinStateRejectsInvalidTransitions() {
         XCTAssertFalse(PinState.resolving.canTransition(to: .passive))
-        XCTAssertFalse(PinState.passive.canTransition(to: .interactive))
+        XCTAssertTrue(PinState.passive.canTransition(to: .interactive))
         XCTAssertFalse(PinState.terminating.canTransition(to: .interactive))
     }
 
@@ -34,7 +63,7 @@ final class ModelsTests: XCTestCase {
             "0-1", "0-5", "0-6",
             "1-2", "1-5", "1-6",
             "2-1", "2-3", "2-5", "2-6",
-            "3-4", "3-5", "3-6",
+            "3-1", "3-4", "3-5", "3-6",
             "4-1", "4-3", "4-5", "4-6",
             "6-5"
         ]

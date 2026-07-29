@@ -6,7 +6,6 @@ final class AXWindowObserver: @unchecked Sendable {
         case destroyed
         case movedOrResized
         case minimized
-        case titleChanged
     }
 
     private var observer: AXObserver?
@@ -31,8 +30,7 @@ final class AXWindowObserver: @unchecked Sendable {
             kAXUIElementDestroyedNotification as CFString,
             kAXMovedNotification as CFString,
             kAXResizedNotification as CFString,
-            kAXWindowMiniaturizedNotification as CFString,
-            kAXTitleChangedNotification as CFString
+            kAXWindowMiniaturizedNotification as CFString
         ]
 
         for notification in notifications {
@@ -64,8 +62,6 @@ final class AXWindowObserver: @unchecked Sendable {
             event = .movedOrResized
         case kAXWindowMiniaturizedNotification:
             event = .minimized
-        case kAXTitleChangedNotification:
-            event = .titleChanged
         default:
             event = nil
         }

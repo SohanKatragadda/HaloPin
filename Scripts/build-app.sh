@@ -8,7 +8,7 @@ APP_PATH="${OUTPUT_DIR}/HaloPin.app"
 CONFIGURATION=${CONFIGURATION:-release}
 SIGN_IDENTITY=${SIGN_IDENTITY:-}
 DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
-BUILD_CACHE="${PROJECT_DIR}/.build"
+BUILD_CACHE=${BUILD_CACHE:-"${PROJECT_DIR}/.build"}
 
 export DEVELOPER_DIR
 export SWIFTPM_MODULECACHE_OVERRIDE="${BUILD_CACHE}/ModuleCache"
@@ -32,12 +32,14 @@ fi
 cd "${PROJECT_DIR}"
 xcrun swift build \
     --disable-sandbox \
+    --scratch-path "${BUILD_CACHE}" \
     -c "${CONFIGURATION}" \
     --arch arm64 \
     --arch x86_64 \
     --product HaloPin
 BIN_DIR=$(xcrun swift build \
     --disable-sandbox \
+    --scratch-path "${BUILD_CACHE}" \
     -c "${CONFIGURATION}" \
     --arch arm64 \
     --arch x86_64 \

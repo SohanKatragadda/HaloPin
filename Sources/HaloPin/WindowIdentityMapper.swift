@@ -3,6 +3,12 @@ import ScreenCaptureKit
 
 @MainActor
 final class ScreenCaptureWindowIdentityMapper: WindowIdentityMapping {
+    private let timing: SessionTiming
+
+    init(timing: SessionTiming = .production) {
+        self.timing = timing
+    }
+
     func map(_ window: ResolvedWindow) async throws -> CaptureWindowReference {
         let content = try await SCShareableContent.excludingDesktopWindows(
             true,
@@ -47,7 +53,7 @@ final class ScreenCaptureWindowIdentityMapper: WindowIdentityMapping {
         ownerPID: pid_t
     ) async throws -> CaptureWindowReference {
         var lastError: Error?
-        for attempt in 0..<3 {
+        for attempt in 0..<timing.windowIdentityRetryCount {
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     true,
@@ -84,8 +90,8 @@ final class ScreenCaptureWindowIdentityMapper: WindowIdentityMapping {
                 lastError = error
             }
 
-            if attempt < 2 {
-                try await Task.sleep(for: .milliseconds(180))
+            if attempt < timing.windowIdentityRetryCount - 1 {
+                try await Task.sleep(for: timing.windowIdentityRetryDelay)
             }
         }
         throw lastError ?? PinFailure.windowMappingFailed

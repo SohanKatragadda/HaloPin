@@ -11,28 +11,32 @@ final class PinSessionController {
     private let resolver: FocusedWindowResolving
     private let mapper: WindowIdentityMapping
     private let windows: WindowControlling
-    private let capture: CaptureStreaming
+    private let captureLifecycle: CaptureLifecycleManaging
     private let preview: PreviewPresenting
     private let feedback: FeedbackPresenting
     private let workspace: WorkspaceObserving
+    private let timing: SessionTiming
+    private let clock = ContinuousClock()
     private let logger = Logger(subsystem: "com.halopin.HaloPin", category: "session")
+    private let signposter = OSSignposter(
+        subsystem: "com.halopin.HaloPin",
+        category: "performance"
+    )
 
     private(set) var session: PinSession?
     private var axObserver: AXWindowObserver?
-    private var lastSampleDate: Date?
-    private var stallTimer: Timer?
     private var operationTask: Task<Void, Never>?
     private var geometryTask: Task<Void, Never>?
+    private var captureModeTask: Task<Void, Never>?
     private var passiveGeometryTask: Task<Void, Never>?
     private var passiveGeometryRevision: UInt64 = 0
     private var isReconcilingPassiveGeometry = false
     private var handoffPendingAfterGeometry = false
     private var spaceRecoveryTask: Task<Void, Never>?
     private var spaceRecoveryRevision: UInt64 = 0
-    private var lastSpaceRecoveryAttempt: Date?
+    private var lastSpaceRecoveryAttempt: ContinuousClock.Instant?
     private var spaceGuidanceShown = false
     private var captureSuspended = false
-    private var captureNeedsRecovery = false
 
     var onMenuNeedsUpdate: (() -> Void)?
 
@@ -40,22 +44,30 @@ final class PinSessionController {
         model: AppModel,
         permissions: PermissionCoordinating,
         resolver: FocusedWindowResolving = FocusedWindowResolver(),
-        mapper: WindowIdentityMapping = ScreenCaptureWindowIdentityMapper(),
+        mapper: WindowIdentityMapping? = nil,
         windows: WindowControlling = AccessibilityWindowController(),
-        capture: CaptureStreaming = ScreenCaptureEngine(),
+        capture: CaptureStreaming? = nil,
+        captureLifecycle: CaptureLifecycleManaging? = nil,
         preview: PreviewPresenting = PreviewPanelController(),
         feedback: FeedbackPresenting = FeedbackPresenter(),
-        workspace: WorkspaceObserving = WorkspaceObserver()
+        workspace: WorkspaceObserving = WorkspaceObserver(),
+        timing: SessionTiming = .production
     ) {
         self.model = model
         self.permissions = permissions
         self.resolver = resolver
-        self.mapper = mapper
+        self.mapper = mapper ?? ScreenCaptureWindowIdentityMapper(timing: timing)
         self.windows = windows
-        self.capture = capture
+        let captureService = capture ?? ScreenCaptureEngine(timing: timing)
+        self.captureLifecycle = captureLifecycle
+            ?? CaptureLifecycleCoordinator(
+                capture: captureService,
+                timing: timing
+            )
         self.preview = preview
         self.feedback = feedback
         self.workspace = workspace
+        self.timing = timing
 
         preview.onActivate = { [weak self] in
             self?.beginHandoff()
@@ -73,29 +85,16 @@ final class PinSessionController {
         preview.onAllDesktopsDeclined = { [weak self] in
             self?.declineAllDesktopsAssignment()
         }
-        capture.onSampleHeartbeat = { [weak self] in
-            guard let self else { return }
-            self.lastSampleDate = Date()
-            if self.session?.crossSpaceCaptureState == .live {
-                self.preview.setPaused(false)
-            }
+        self.captureLifecycle.onHealthChanged = { [weak self] health in
+            self?.handleCaptureHealth(health)
         }
-        capture.onCompleteFrame = { [weak self] in
-            guard let self,
-                  self.session?.crossSpaceCaptureState == .live else {
-                return
-            }
-            self.preview.setPaused(false)
-        }
-        capture.onFailure = { [weak self] error in
+        self.captureLifecycle.onFailure = { [weak self] error in
             self?.handleCaptureFailure(error)
         }
 
         workspace.onEvent = { [weak self] event in
             self?.handleWorkspaceEvent(event)
         }
-        workspace.start()
-        startStallTimer()
     }
 
     func togglePin() {
@@ -129,8 +128,8 @@ final class PinSessionController {
     ) {
         guard var current = session else { return }
         let wasPassive = current.state != .interactive
-        current.state = .terminating
-        session = current
+        guard transitionSession(to: .terminating) else { return }
+        current = session ?? current
 
         if let frame = preview.previewFrame, wasPassive {
             _ = try? windows.apply(frame: frame, to: current.axWindow)
@@ -140,21 +139,20 @@ final class PinSessionController {
         operationTask = nil
         geometryTask?.cancel()
         geometryTask = nil
+        captureModeTask?.cancel()
+        captureModeTask = nil
         cancelPassiveGeometry()
         cancelSpaceRecovery()
         axObserver = nil
+        workspace.stop()
         preview.tearDown()
-        lastSampleDate = nil
         lastSpaceRecoveryAttempt = nil
         spaceGuidanceShown = false
         captureSuspended = false
-        captureNeedsRecovery = false
         session = nil
         model.clearSession()
 
-        Task { [capture] in
-            await capture.stop()
-        }
+        captureLifecycle.requestStop()
 
         if let reason {
             model.show(error: reason)
@@ -175,6 +173,8 @@ final class PinSessionController {
     }
 
     private func pinFocusedWindow() async {
+        let interval = signposter.beginInterval("Pin Establishment")
+        defer { signposter.endInterval("Pin Establishment", interval) }
         guard permissions.hasAccessibilityPermission else {
             permissions.requestAccessibilityPermission()
             fail(PinFailure.accessibilityPermissionMissing)
@@ -191,14 +191,6 @@ final class PinSessionController {
             let resolved = try resolver.resolveFocusedWindow()
             let captureWindow = try await mapper.map(resolved)
 
-            try await capture.start(window: captureWindow)
-            try await capture.validateInitialFrame(timeout: .seconds(2))
-            preview.configure(
-                displayLayer: capture.displayLayer,
-                frame: resolved.frame,
-                aspectRatio: resolved.frame.size
-            )
-
             session = PinSession(
                 ownerPID: resolved.ownerPID,
                 bundleIdentifier: resolved.bundleIdentifier,
@@ -208,14 +200,23 @@ final class PinSessionController {
                 axWindow: resolved.axWindow,
                 sourceFrame: resolved.frame,
                 previewFrame: resolved.frame,
-                state: .interactive
+                state: .resolving
             )
+            try await captureLifecycle.prepare(window: captureWindow)
+            preview.configure(
+                displayLayer: captureLifecycle.displayLayer,
+                frame: resolved.frame,
+                aspectRatio: resolved.frame.size
+            )
+
+            guard transitionSession(to: .interactive) else {
+                throw PinFailure.captureFailed
+            }
             spaceGuidanceShown = false
-            captureNeedsRecovery = false
             model.pinnedWindowName = session?.displayName
             model.presentationState = .interactive
-            lastSampleDate = Date()
             installAXObserver(for: resolved)
+            workspace.start()
             onMenuNeedsUpdate?()
 
             feedback.presentPinFeedback(
@@ -223,15 +224,22 @@ final class PinSessionController {
                 halo: model.haloEnabled,
                 sound: model.soundEnabled
             )
+            await captureLifecycle.enterWarm(frame: resolved.frame)
         } catch is CancellationError {
-            await capture.stop()
+            captureLifecycle.requestStop()
+            await captureLifecycle.waitUntilStopped()
+            workspace.stop()
             preview.tearDown()
+            session = nil
             model.clearSession()
             onMenuNeedsUpdate?()
         } catch {
             logCaptureError("Pin failed", error: error)
-            await capture.stop()
+            captureLifecycle.requestStop()
+            await captureLifecycle.waitUntilStopped()
+            workspace.stop()
             preview.tearDown()
+            session = nil
             if isScreenCaptureAuthorizationError(error) {
                 fail(PinFailure.screenRecordingPermissionMissing)
             } else {
@@ -255,7 +263,8 @@ final class PinSessionController {
         }
 
         geometryTask?.cancel()
-        current.state = .becomingPassive
+        guard transitionSession(to: .becomingPassive) else { return }
+        current = session ?? current
         current.crossSpaceCaptureState = .live
         preview.setCrossSpaceState(
             .live,
@@ -268,30 +277,19 @@ final class PinSessionController {
             preview.animate(to: frame)
         }
         session = current
-        let targetFrame = current.previewFrame
         geometryTask = Task { [weak self] in
-            await self?.finishBecomingPassive(at: targetFrame)
+            await self?.finishBecomingPassive()
         }
     }
 
-    private func finishBecomingPassive(at frame: CGRect) async {
-        do {
-            try await capture.resize(to: frame)
-        } catch is CancellationError {
-            return
-        } catch {
-            handleCaptureFailure(error)
-        }
-        _ = await capture.awaitCompleteFrameAdvance(
-            count: 2,
-            timeout: .milliseconds(120)
-        )
-        guard var current = session, current.state == .becomingPassive else {
+    private func finishBecomingPassive() async {
+        let interval = signposter.beginInterval("Passive Entry")
+        defer { signposter.endInterval("Passive Entry", interval) }
+        guard session?.state == .becomingPassive else {
             return
         }
         preview.show()
-        current.state = .passive
-        session = current
+        guard transitionSession(to: .passive) else { return }
         model.presentationState = .passive
         onMenuNeedsUpdate?()
         // Always reacquire and recreate capture after the source deactivates.
@@ -307,7 +305,8 @@ final class PinSessionController {
         cancelSpaceRecovery()
         cancelPassiveGeometry()
         preview.hide()
-        current.state = .interactive
+        guard transitionSession(to: .interactive) else { return }
+        current = session ?? current
         current.crossSpaceCaptureState = .live
         if let frame = try? windows.frame(of: current.axWindow) {
             current.sourceFrame = frame
@@ -316,6 +315,11 @@ final class PinSessionController {
         session = current
         model.presentationState = .interactive
         onMenuNeedsUpdate?()
+        captureModeTask?.cancel()
+        let frame = current.sourceFrame
+        captureModeTask = Task { [weak self] in
+            await self?.captureLifecycle.enterWarm(frame: frame)
+        }
     }
 
     private func beginHandoff() {
@@ -330,7 +334,8 @@ final class PinSessionController {
 
     private func startHandoff() {
         guard var current = session, current.state == .passive else { return }
-        current.state = .handingOff
+        guard transitionSession(to: .handingOff) else { return }
+        current = session ?? current
         current.crossSpaceCaptureState = .live
         preview.setCrossSpaceState(
             .live,
@@ -426,7 +431,7 @@ final class PinSessionController {
         }
 
         do {
-            try await capture.resize(to: acceptedFrame)
+            try await captureLifecycle.updateGeometry(acceptedFrame)
         } catch is CancellationError {
             return
         } catch {
@@ -436,9 +441,9 @@ final class PinSessionController {
         guard isCurrentPassiveGeometry(windowID: windowID, revision: revision) else {
             return
         }
-        _ = await capture.awaitCompleteFrameAdvance(
+        _ = await captureLifecycle.awaitCompleteFrameAdvance(
             count: 2,
-            timeout: .milliseconds(120)
+            timeout: timing.passiveFrameWait
         )
     }
 
@@ -451,10 +456,10 @@ final class PinSessionController {
         var acceptedFrame = initialFrame
         var consecutiveStableReads = 0
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .milliseconds(120))
+        let deadline = clock.now.advanced(by: timing.geometrySettleTimeout)
 
         while clock.now < deadline, consecutiveStableReads < 2 {
-            try? await Task.sleep(for: .milliseconds(16))
+            try? await Task.sleep(for: timing.geometryPollInterval)
             guard isCurrentPassiveGeometry(windowID: windowID, revision: revision) else {
                 return acceptedFrame
             }
@@ -498,13 +503,15 @@ final class PinSessionController {
         handoffPendingAfterGeometry = false
     }
 
-    #if DEBUG
+    // Internal test seam. Whole-module optimization removes it from the
+    // release executable because production code never references it.
     func installSessionForTesting(_ session: PinSession) {
         self.session = session
     }
-    #endif
 
     private func performHandoff() async {
+        let interval = signposter.beginInterval("Native Handoff")
+        defer { signposter.endInterval("Native Handoff", interval) }
         guard var current = session, current.state == .handingOff else { return }
         do {
             let acceptedFrame = try windows.apply(
@@ -529,14 +536,14 @@ final class PinSessionController {
             let activated = await waitForActivation(
                 application,
                 window: current.axWindow,
-                timeout: 2.5
+                timeout: timing.handoffActivationTimeout
             )
             if !activated {
                 try windows.raise(current.axWindow)
                 let activatedAfterRetry = await waitForActivation(
                     application,
                     window: current.axWindow,
-                    timeout: 0.5
+                    timeout: timing.handoffRetryTimeout
                 )
                 if !activatedAfterRetry {
                     throw PinFailure.activationFailed
@@ -548,16 +555,16 @@ final class PinSessionController {
                     continuation.resume()
                 }
             }
-            guard var latest = session else { return }
-            latest.state = .interactive
-            session = latest
+            guard transitionSession(to: .interactive),
+                  let latest = session else {
+                return
+            }
             model.presentationState = .interactive
             onMenuNeedsUpdate?()
+            await captureLifecycle.enterWarm(frame: latest.sourceFrame)
         } catch {
             logger.error("Handoff failed: \(String(describing: error), privacy: .private)")
-            guard var latest = session else { return }
-            latest.state = .passive
-            session = latest
+            guard transitionSession(to: .passive) else { return }
             preview.show()
             model.show(error: error)
             feedback.showHUD(error.localizedDescription)
@@ -568,15 +575,15 @@ final class PinSessionController {
     private func waitForActivation(
         _ application: NSRunningApplication,
         window: AXUIElement,
-        timeout: TimeInterval
+        timeout: Duration
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
             if application.isActive,
                windows.isFrontmost(window, ownerPID: application.processIdentifier) {
                 return true
             }
-            try? await Task.sleep(for: .milliseconds(50))
+            try? await Task.sleep(for: timing.handoffPollInterval)
             if Task.isCancelled { return false }
         }
         return application.isActive
@@ -602,8 +609,6 @@ final class PinSessionController {
         case .movedOrResized:
             guard current.state == .interactive else { return }
             scheduleInteractiveGeometryRefresh()
-        case .titleChanged:
-            break
         }
     }
 
@@ -614,7 +619,6 @@ final class PinSessionController {
             unpin(reason: .permissionRevoked)
             return
         }
-        captureNeedsRecovery = true
         guard current.crossSpaceCaptureState == .live
                 || current.crossSpaceCaptureState == .recovering else {
             return
@@ -637,19 +641,20 @@ final class PinSessionController {
         operationTask?.cancel()
         operationTask = nil
         preview.tearDown()
+        workspace.stop()
+        session = nil
         model.clearSession()
         onMenuNeedsUpdate?()
-        Task { [capture] in
-            await capture.stop()
-        }
+        captureLifecycle.requestStop()
     }
 
     private func scheduleInteractiveGeometryRefresh() {
         geometryTask?.cancel()
         geometryTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(80))
+            guard let self else { return }
+            try? await Task.sleep(for: self.timing.interactiveGeometryDebounce)
             guard !Task.isCancelled else { return }
-            await self?.refreshInteractiveGeometry()
+            await self.refreshInteractiveGeometry()
         }
     }
 
@@ -666,7 +671,7 @@ final class PinSessionController {
         preview.updateSourceGeometry(frame)
         preview.animate(to: frame)
         do {
-            try await capture.resize(to: frame)
+            try await captureLifecycle.updateGeometry(frame)
         } catch {
             handleCaptureFailure(error)
         }
@@ -688,15 +693,14 @@ final class PinSessionController {
             // A source application can remain active after switching to a
             // Space where its pinned window is absent. Do not rely solely on
             // an application-deactivation notification to enter passive mode.
-            captureNeedsRecovery = true
             if session?.state == .passive || session?.state == .becomingPassive {
                 preview.show()
             }
-            scheduleSpaceRecovery(after: .milliseconds(180))
+            scheduleSpaceRecovery(after: timing.spaceRecoveryDebounce)
         case .screensChanged:
             preview.clampToVisibleScreens()
             if session?.state == .passive {
-                scheduleSpaceRecovery(after: .milliseconds(180))
+                scheduleSpaceRecovery(after: timing.spaceRecoveryDebounce)
             }
         case .suspend:
             suspendCapture()
@@ -736,11 +740,13 @@ final class PinSessionController {
         }
 
         let clock = ContinuousClock()
-        let passiveDeadline = clock.now.advanced(by: .milliseconds(300))
+        let passiveDeadline = clock.now.advanced(
+            by: timing.spaceTransitionSettleTimeout
+        )
         while session?.state == .interactive
                 || session?.state == .becomingPassive,
               clock.now < passiveDeadline {
-            try? await Task.sleep(for: .milliseconds(25))
+            try? await Task.sleep(for: timing.spaceStatePollInterval)
             guard isCurrentSpaceRecovery(revision: revision) else { return }
         }
         guard isCurrentSpaceRecovery(revision: revision),
@@ -756,7 +762,7 @@ final class PinSessionController {
             current.sourceFrame = latestFrame
             session = current
         }
-        lastSpaceRecoveryAttempt = Date()
+        lastSpaceRecoveryAttempt = clock.now
         updateCrossSpaceState(.recovering)
 
         do {
@@ -766,10 +772,12 @@ final class PinSessionController {
             )
             if pollForAvailability,
                refreshedWindow.availability == .offSpace {
-                let availabilityDeadline = clock.now.advanced(by: .seconds(1))
+                let availabilityDeadline = clock.now.advanced(
+                    by: timing.availabilityPollTimeout
+                )
                 while refreshedWindow.availability == .offSpace,
                       clock.now < availabilityDeadline {
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await Task.sleep(for: timing.availabilityPollInterval)
                     guard isCurrentSpaceRecovery(revision: revision) else {
                         return
                     }
@@ -780,17 +788,18 @@ final class PinSessionController {
                 }
             }
             guard isCurrentSpaceRecovery(revision: revision),
-                  var latest = session else {
+                  let latest = session else {
                 return
             }
             if latest.state == .interactive {
                 guard refreshedWindow.availability == .offSpace else {
-                    captureNeedsRecovery = false
                     updateCrossSpaceState(.live)
                     return
                 }
-                latest.state = .passive
-                session = latest
+                guard transitionSession(to: .becomingPassive),
+                      transitionSession(to: .passive) else {
+                    return
+                }
                 preview.show()
                 enterOffSpaceFallback()
                 return
@@ -800,13 +809,14 @@ final class PinSessionController {
                 enterOffSpaceFallback()
                 return
             }
-            try await capture.refresh(
+            let interval = signposter.beginInterval("Capture Rebind")
+            defer { signposter.endInterval("Capture Rebind", interval) }
+            try await captureLifecycle.enterLive(
                 window: refreshedWindow,
                 frame: latest.sourceFrame
             )
+            signposter.emitEvent("First Fresh Frame")
             guard isCurrentSpaceRecovery(revision: revision) else { return }
-            captureNeedsRecovery = false
-            lastSampleDate = Date()
             preview.setPaused(false)
             updateCrossSpaceState(.live)
         } catch is CancellationError {
@@ -850,14 +860,16 @@ final class PinSessionController {
         // The current stream may be stopped or bound to the old Space. Keep a
         // recovery pending so a later native handoff/deactivation can restore
         // live capture once the source is visible again.
-        captureNeedsRecovery = true
-        lastSampleDate = nil
         preview.setPaused(false)
         if spaceGuidanceShown {
             updateCrossSpaceState(.pausedOffSpace)
         } else {
             spaceGuidanceShown = true
             updateCrossSpaceState(.offSpaceAwaitingChoice)
+        }
+        captureModeTask?.cancel()
+        captureModeTask = Task { [weak self] in
+            await self?.captureLifecycle.pausePreservingFrame()
         }
     }
 
@@ -894,6 +906,20 @@ final class PinSessionController {
         )
     }
 
+    @discardableResult
+    private func transitionSession(to next: PinState) -> Bool {
+        guard var current = session else { return false }
+        guard current.state.canTransition(to: next) else {
+            logger.error(
+                "Rejected pin-state transition: \(String(describing: current.state), privacy: .public) -> \(String(describing: next), privacy: .public)"
+            )
+            return false
+        }
+        current.state = next
+        session = current
+        return true
+    }
+
     private func isCurrentSpaceRecovery(revision: UInt64) -> Bool {
         !Task.isCancelled
             && spaceRecoveryRevision == revision
@@ -911,26 +937,26 @@ final class PinSessionController {
         spaceRecoveryTask = nil
     }
 
-    private func startStallTimer() {
-        stallTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
-            [weak self] _ in
-            Task { @MainActor in
-                guard let self,
-                      self.session?.state == .passive,
-                      self.session?.crossSpaceCaptureState == .live else {
-                    return
-                }
-                let stalled = self.lastSampleDate.map {
-                    Date().timeIntervalSince($0) > 1.5
-                } ?? true
-                self.preview.setPaused(stalled)
-                guard stalled, self.spaceRecoveryTask == nil else { return }
-                let recoveryAllowed = self.lastSpaceRecoveryAttempt.map {
-                    Date().timeIntervalSince($0) > 2
-                } ?? true
-                if recoveryAllowed {
-                    self.scheduleSpaceRecovery(after: .zero)
-                }
+    private func handleCaptureHealth(_ health: CaptureHealth) {
+        guard session?.state == .passive,
+              session?.crossSpaceCaptureState == .live else {
+            return
+        }
+        switch health {
+        case .healthy:
+            preview.setPaused(false)
+        case .stalled:
+            preview.setPaused(true)
+            guard spaceRecoveryTask == nil else { return }
+            let recoveryAllowed = lastSpaceRecoveryAttempt.map {
+                $0.duration(to: clock.now) > timing.captureRecoveryCooldown
+            } ?? true
+            if recoveryAllowed {
+                scheduleSpaceRecovery(after: .zero)
+            }
+        case .stopped:
+            if !captureSuspended {
+                preview.setPaused(true)
             }
         }
     }
@@ -940,8 +966,9 @@ final class PinSessionController {
         cancelSpaceRecovery()
         captureSuspended = true
         preview.setPaused(true)
-        Task { [capture] in
-            await capture.stop()
+        captureModeTask?.cancel()
+        captureModeTask = Task { [weak self] in
+            await self?.captureLifecycle.suspend()
         }
     }
 
@@ -965,11 +992,16 @@ final class PinSessionController {
                 enterOffSpaceFallback()
                 return
             }
-            try await capture.start(window: refreshedWindow)
-            try await capture.validateInitialFrame(timeout: .seconds(2))
+            if current.state == .passive {
+                try await captureLifecycle.enterLive(
+                    window: refreshedWindow,
+                    frame: current.sourceFrame
+                )
+            } else {
+                try await captureLifecycle.prepare(window: refreshedWindow)
+                await captureLifecycle.enterWarm(frame: current.sourceFrame)
+            }
             captureSuspended = false
-            captureNeedsRecovery = false
-            lastSampleDate = Date()
             preview.setPaused(false)
             updateCrossSpaceState(.live)
         } catch {

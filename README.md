@@ -58,6 +58,12 @@ The package uses Swift 6.2, AppKit, SwiftUI, Accessibility, Carbon hot keys,
 ScreenCaptureKit, AVFoundation, and ServiceManagement. It has no third-party
 dependencies.
 
+Capture work is profile-driven: hidden interactive windows use a capped 1 fps
+warm stream, visible passive previews use native-resolution 30 fps capture,
+and off-Space or suspended sessions stop the stream while retaining the last
+displayed image. See [PERFORMANCE.md](PERFORMANCE.md) for the implementation
+report and profiling procedure.
+
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcrun swift test --disable-sandbox
@@ -116,5 +122,5 @@ validates both.
 - `Scripts`: universal build, DMG packaging, and notarization
 
 See [PRIVACY.md](PRIVACY.md), [PERMISSIONS.md](PERMISSIONS.md),
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md), and
+[PERFORMANCE.md](PERFORMANCE.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md), and
 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).

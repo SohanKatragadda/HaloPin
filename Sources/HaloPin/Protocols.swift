@@ -48,15 +48,42 @@ protocol WindowControlling: AnyObject {
 @MainActor
 protocol CaptureStreaming: AnyObject {
     var displayLayer: AVSampleBufferDisplayLayer { get }
-    var onSampleHeartbeat: (() -> Void)? { get set }
-    var onCompleteFrame: (() -> Void)? { get set }
+    var onHealthChanged: ((CaptureHealth) -> Void)? { get set }
     var onFailure: ((Error) -> Void)? { get set }
-    func start(window: CaptureWindowReference) async throws
-    func refresh(window: CaptureWindowReference, frame: CGRect) async throws
-    func resize(to frame: CGRect) async throws
+    func start(
+        window: CaptureWindowReference,
+        profile: CaptureProfile
+    ) async throws
+    func refresh(
+        window: CaptureWindowReference,
+        frame: CGRect,
+        profile: CaptureProfile
+    ) async throws
+    func update(frame: CGRect, profile: CaptureProfile) async throws
     func awaitCompleteFrameAdvance(count: UInt64, timeout: Duration) async -> Bool
     func validateInitialFrame(timeout: Duration) async throws
-    func stop() async
+    func setHealthMonitoring(enabled: Bool, stallTimeout: Duration)
+    func stop(preserveDisplayedFrame: Bool) async
+}
+
+@MainActor
+protocol CaptureLifecycleManaging: AnyObject {
+    var displayLayer: AVSampleBufferDisplayLayer { get }
+    var mode: CaptureLifecycleMode { get }
+    var onHealthChanged: ((CaptureHealth) -> Void)? { get set }
+    var onFailure: ((Error) -> Void)? { get set }
+    func prepare(window: CaptureWindowReference) async throws
+    func enterWarm(frame: CGRect) async
+    func enterLive(
+        window: CaptureWindowReference,
+        frame: CGRect
+    ) async throws
+    func updateGeometry(_ frame: CGRect) async throws
+    func awaitCompleteFrameAdvance(count: UInt64, timeout: Duration) async -> Bool
+    func pausePreservingFrame() async
+    func suspend() async
+    func requestStop()
+    func waitUntilStopped() async
 }
 
 @MainActor
@@ -105,4 +132,5 @@ enum WorkspaceEvent: Sendable {
 protocol WorkspaceObserving: AnyObject {
     var onEvent: ((WorkspaceEvent) -> Void)? { get set }
     func start()
+    func stop()
 }

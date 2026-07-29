@@ -17,6 +17,49 @@ final class PassiveGeometryTests: XCTestCase {
         XCTAssertFalse(second.nativeGeometrySyncEnabled)
     }
 
+    func testIdleControllerHasNoWorkspaceObserversOrCapture() {
+        let harness = makeHarness(installSession: false)
+
+        XCTAssertEqual(harness.workspace.startCount, 0)
+        XCTAssertEqual(harness.workspace.stopCount, 0)
+        XCTAssertTrue(harness.capture.profiles.isEmpty)
+        XCTAssertTrue(harness.capture.healthMonitoringValues.isEmpty)
+    }
+
+    func testSuccessfulPinValidatesLiveThenWarmsAndScopesObservers() async {
+        let harness = makeHarness(installSession: false)
+        let axWindow = AXUIElementCreateApplication(
+            ProcessInfo.processInfo.processIdentifier
+        )
+        harness.resolver.result = ResolvedWindow(
+            ownerPID: ProcessInfo.processInfo.processIdentifier,
+            bundleIdentifier: "com.halopin.tests",
+            applicationName: "Fixture",
+            title: "Window",
+            axWindow: axWindow,
+            frame: harness.originalFrame
+        )
+        harness.mapper.mapResult = .testWindow(availability: .available)
+
+        harness.controller.togglePin()
+        await waitUntil {
+            harness.workspace.startCount == 1
+                && harness.capture.profiles.count >= 2
+        }
+
+        XCTAssertEqual(Array(harness.capture.profiles.prefix(2)), [.live, .warm])
+        XCTAssertEqual(harness.controller.session?.state, .interactive)
+        XCTAssertEqual(harness.workspace.stopCount, 0)
+
+        harness.controller.unpin(trigger: .userInitiated)
+        await waitUntil {
+            harness.capture.stopPreservationValues.last == false
+        }
+
+        XCTAssertEqual(harness.workspace.stopCount, 1)
+        XCTAssertNil(harness.controller.session)
+    }
+
     func testEnabledCommitAppliesFullFrameAndUsesAcceptedGeometry() async {
         let harness = makeHarness()
         let desired = CGRect(x: 420, y: 180, width: 640, height: 400)
@@ -204,7 +247,7 @@ final class PassiveGeometryTests: XCTestCase {
         XCTAssertEqual(harness.preview.crossSpaceStates.last, .pausedOffSpace)
 
         let pauseUpdateCount = harness.preview.pausedValues.count
-        harness.capture.onSampleHeartbeat?()
+        harness.capture.onHealthChanged?(.healthy)
         XCTAssertEqual(harness.preview.pausedValues.count, pauseUpdateCount)
     }
 
@@ -337,7 +380,7 @@ final class PassiveGeometryTests: XCTestCase {
         XCTAssertTrue(harness.feedback.unpinSoundValues.isEmpty)
     }
 
-    private func makeHarness() -> Harness {
+    private func makeHarness(installSession: Bool = true) -> Harness {
         let defaults = makeDefaults()
         let model = AppModel(defaults: defaults)
         let permissions = MockPermissions()
@@ -347,10 +390,11 @@ final class PassiveGeometryTests: XCTestCase {
         let feedback = MockFeedback()
         let workspace = MockWorkspace()
         let mapper = MockMapper()
+        let resolver = MockResolver()
         let controller = PinSessionController(
             model: model,
             permissions: permissions,
-            resolver: MockResolver(),
+            resolver: resolver,
             mapper: mapper,
             windows: windows,
             capture: capture,
@@ -361,22 +405,24 @@ final class PassiveGeometryTests: XCTestCase {
         let originalFrame = CGRect(x: 100, y: 100, width: 800, height: 600)
         windows.currentFrame = originalFrame
         preview.previewFrame = originalFrame
-        controller.installSessionForTesting(
-            PinSession(
-                ownerPID: ProcessInfo.processInfo.processIdentifier,
-                bundleIdentifier: "com.halopin.tests",
-                applicationName: "Fixture",
-                title: "Window",
-                windowID: 42,
-                axWindow: AXUIElementCreateApplication(
-                    ProcessInfo.processInfo.processIdentifier
-                ),
-                sourceFrame: originalFrame,
-                previewFrame: originalFrame,
-                state: .passive
+        if installSession {
+            controller.installSessionForTesting(
+                PinSession(
+                    ownerPID: ProcessInfo.processInfo.processIdentifier,
+                    bundleIdentifier: "com.halopin.tests",
+                    applicationName: "Fixture",
+                    title: "Window",
+                    windowID: 42,
+                    axWindow: AXUIElementCreateApplication(
+                        ProcessInfo.processInfo.processIdentifier
+                    ),
+                    sourceFrame: originalFrame,
+                    previewFrame: originalFrame,
+                    state: .passive
+                )
             )
-        )
-        model.presentationState = .passive
+            model.presentationState = .passive
+        }
         return Harness(
             controller: controller,
             model: model,
@@ -384,6 +430,7 @@ final class PassiveGeometryTests: XCTestCase {
             capture: capture,
             preview: preview,
             feedback: feedback,
+            resolver: resolver,
             mapper: mapper,
             workspace: workspace,
             originalFrame: originalFrame
@@ -418,6 +465,7 @@ private struct Harness {
     let capture: MockCapture
     let preview: MockPreview
     let feedback: MockFeedback
+    let resolver: MockResolver
     let mapper: MockMapper
     let workspace: MockWorkspace
     let originalFrame: CGRect
@@ -441,8 +489,11 @@ private final class MockPermissions: PermissionCoordinating {
 
 @MainActor
 private final class MockResolver: FocusedWindowResolving {
+    var result: ResolvedWindow?
+
     func resolveFocusedWindow() throws -> ResolvedWindow {
-        throw TestFailure.unused
+        guard let result else { throw TestFailure.unused }
+        return result
     }
 }
 
@@ -453,9 +504,11 @@ private final class MockMapper: WindowIdentityMapping {
     var refreshResults: [CaptureWindowReference] = [
         .testWindow(availability: .offSpace)
     ]
+    var mapResult: CaptureWindowReference?
 
     func map(_ window: ResolvedWindow) async throws -> CaptureWindowReference {
-        throw TestFailure.unused
+        guard let mapResult else { throw TestFailure.unused }
+        return mapResult
     }
 
     func refresh(
@@ -513,23 +566,34 @@ private final class MockWindows: WindowControlling {
 @MainActor
 private final class MockCapture: CaptureStreaming {
     let displayLayer = AVSampleBufferDisplayLayer()
-    var onSampleHeartbeat: (() -> Void)?
-    var onCompleteFrame: (() -> Void)?
+    var onHealthChanged: ((CaptureHealth) -> Void)?
     var onFailure: ((Error) -> Void)?
     var resizedFrames: [CGRect] = []
+    var profiles: [CaptureProfile] = []
     var frameAdvanceCounts: [UInt64] = []
     var refreshedWindows: [CaptureWindowReference] = []
+    var stopPreservationValues: [Bool] = []
+    var healthMonitoringValues: [Bool] = []
 
-    func start(window: CaptureWindowReference) async throws {}
-    func refresh(
+    func start(
         window: CaptureWindowReference,
-        frame: CGRect
+        profile: CaptureProfile
     ) async throws {
-        refreshedWindows.append(window)
+        profiles.append(profile)
     }
 
-    func resize(to frame: CGRect) async throws {
+    func refresh(
+        window: CaptureWindowReference,
+        frame: CGRect,
+        profile: CaptureProfile
+    ) async throws {
+        refreshedWindows.append(window)
+        profiles.append(profile)
+    }
+
+    func update(frame: CGRect, profile: CaptureProfile) async throws {
         resizedFrames.append(frame)
+        profiles.append(profile)
     }
 
     func awaitCompleteFrameAdvance(count: UInt64, timeout: Duration) async -> Bool {
@@ -538,7 +602,12 @@ private final class MockCapture: CaptureStreaming {
     }
 
     func validateInitialFrame(timeout: Duration) async throws {}
-    func stop() async {}
+    func setHealthMonitoring(enabled: Bool, stallTimeout: Duration) {
+        healthMonitoringValues.append(enabled)
+    }
+    func stop(preserveDisplayedFrame: Bool) async {
+        stopPreservationValues.append(preserveDisplayedFrame)
+    }
 }
 
 @MainActor
@@ -610,7 +679,10 @@ private final class MockFeedback: FeedbackPresenting {
 @MainActor
 private final class MockWorkspace: WorkspaceObserving {
     var onEvent: ((WorkspaceEvent) -> Void)?
-    func start() {}
+    var startCount = 0
+    var stopCount = 0
+    func start() { startCount += 1 }
+    func stop() { stopCount += 1 }
 
     func emit(_ event: WorkspaceEvent) {
         onEvent?(event)

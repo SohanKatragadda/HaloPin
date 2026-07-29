@@ -13,7 +13,6 @@ final class PreviewPanelController: NSObject, PreviewPresenting, NSWindowDelegat
     private var content: PreviewContentView?
     private var suppressFrameCallback = false
     private var isUserLiveResizing = false
-    private var configuredAspectRatio = CGSize(width: 1, height: 1)
 
     var previewFrame: CGRect? {
         guard let frame = panel?.frame else { return nil }
@@ -22,7 +21,6 @@ final class PreviewPanelController: NSObject, PreviewPresenting, NSWindowDelegat
 
     func configure(displayLayer: CALayer, frame: CGRect, aspectRatio: CGSize) {
         tearDown()
-        configuredAspectRatio = aspectRatio
 
         let content = PreviewContentView(frame: .zero)
         content.attach(displayLayer: displayLayer)
@@ -111,7 +109,6 @@ final class PreviewPanelController: NSObject, PreviewPresenting, NSWindowDelegat
     }
 
     func updateSourceGeometry(_ frame: CGRect) {
-        configuredAspectRatio = frame.size
         panel?.contentAspectRatio = frame.size
         panel?.minSize = CGSize(
             width: 160,
@@ -244,15 +241,24 @@ private final class PreviewContentView: NSView {
     var onAllDesktopsDeclined: (() -> Void)?
 
     var isFrozen = false {
-        didSet { updateOverlay() }
+        didSet {
+            guard isFrozen != oldValue else { return }
+            updateOverlay()
+        }
     }
 
     var isPaused = false {
-        didSet { updateOverlay() }
+        didSet {
+            guard isPaused != oldValue else { return }
+            updateOverlay()
+        }
     }
 
     private var crossSpaceState: CrossSpaceCaptureState = .live {
-        didSet { updateOverlay() }
+        didSet {
+            guard crossSpaceState != oldValue else { return }
+            updateOverlay()
+        }
     }
 
     private weak var displayLayer: CALayer?
