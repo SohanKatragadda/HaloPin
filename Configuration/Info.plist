@@ -10,6 +10,8 @@
     <string>HaloPin</string>
     <key>CFBundleIdentifier</key>
     <string>com.halopin.HaloPin</string>
+    <key>CFBundleIconFile</key>
+    <string>HaloPin</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

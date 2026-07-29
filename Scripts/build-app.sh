@@ -50,6 +50,8 @@ BIN_DIR=$(xcrun swift build \
 /bin/mkdir -p "${APP_PATH}/Contents/Resources"
 /bin/cp "${BIN_DIR}/HaloPin" "${APP_PATH}/Contents/MacOS/HaloPin"
 /bin/cp "${PROJECT_DIR}/Configuration/Info.plist" "${APP_PATH}/Contents/Info.plist"
+/bin/cp "${PROJECT_DIR}/Configuration/HaloPin.icns" \
+    "${APP_PATH}/Contents/Resources/HaloPin.icns"
 /bin/chmod 755 "${APP_PATH}/Contents/MacOS/HaloPin"
 
 if [[ -n ${PRODUCT_BUNDLE_IDENTIFIER:-} ]]; then
