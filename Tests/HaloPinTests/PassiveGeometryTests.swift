@@ -170,6 +170,7 @@ final class PassiveGeometryTests: XCTestCase {
 
     func testSourceActivationCancelsPendingSpaceRecovery() async {
         let harness = makeHarness()
+        harness.windows.frontmost = true
 
         harness.workspace.emit(.activeSpaceChanged)
         harness.workspace.emit(
@@ -179,6 +180,76 @@ final class PassiveGeometryTests: XCTestCase {
 
         XCTAssertEqual(harness.mapper.refreshCallCount, 0)
         XCTAssertEqual(harness.controller.session?.state, .interactive)
+    }
+
+    func testSiblingWindowFocusMakesPinnedWindowPassive() async {
+        let harness = makeHarness()
+        guard var current = harness.controller.session else {
+            XCTFail("Missing test session")
+            return
+        }
+        current.state = .interactive
+        harness.controller.installSessionForTesting(current)
+        harness.model.presentationState = .interactive
+        harness.windows.frontmost = false
+        harness.mapper.refreshResults = [
+            .testWindow(availability: .available)
+        ]
+
+        harness.controller.handleAXEventForTesting(.focusedWindowChanged)
+
+        await waitUntil { harness.controller.session?.state == .passive }
+        XCTAssertEqual(harness.preview.showCount, 1)
+        XCTAssertEqual(harness.model.presentationState, .passive)
+    }
+
+    func testPinnedWindowRegainingFocusMakesSessionInteractive() {
+        let harness = makeHarness()
+        harness.windows.frontmost = true
+
+        harness.controller.handleAXEventForTesting(.focusedWindowChanged)
+
+        XCTAssertEqual(harness.controller.session?.state, .interactive)
+        XCTAssertEqual(harness.model.presentationState, .interactive)
+    }
+
+    func testOwnerActivationWithSiblingFocusedKeepsPreviewPassive() {
+        let harness = makeHarness()
+        harness.windows.frontmost = false
+
+        harness.workspace.emit(
+            .applicationActivated(ProcessInfo.processInfo.processIdentifier)
+        )
+
+        XCTAssertEqual(harness.controller.session?.state, .passive)
+        XCTAssertEqual(harness.model.presentationState, .passive)
+    }
+
+    func testOwnerActivationWithPinnedWindowFocusedBecomesInteractive() {
+        let harness = makeHarness()
+        harness.windows.frontmost = true
+
+        harness.workspace.emit(
+            .applicationActivated(ProcessInfo.processInfo.processIdentifier)
+        )
+
+        XCTAssertEqual(harness.controller.session?.state, .interactive)
+        XCTAssertEqual(harness.model.presentationState, .interactive)
+    }
+
+    func testFocusedWindowChangeIsIgnoredDuringHandoff() {
+        let harness = makeHarness()
+        guard var current = harness.controller.session else {
+            XCTFail("Missing test session")
+            return
+        }
+        current.state = .handingOff
+        harness.controller.installSessionForTesting(current)
+        harness.windows.frontmost = false
+
+        harness.controller.handleAXEventForTesting(.focusedWindowChanged)
+
+        XCTAssertEqual(harness.controller.session?.state, .handingOff)
     }
 
     func testSpaceChangeShowsPreviewWhenOwnerRemainsActiveOffSpace() async {
@@ -529,6 +600,7 @@ private final class MockWindows: WindowControlling {
     var applyError: Error?
     var appliedFrames: [CGRect] = []
     var raiseCount = 0
+    var frontmost = false
     var minimized = false
     var fullscreen = false
 
@@ -551,7 +623,7 @@ private final class MockWindows: WindowControlling {
     }
 
     func isFrontmost(_ window: AXUIElement, ownerPID: pid_t) -> Bool {
-        false
+        frontmost
     }
 
     func isMinimized(_ window: AXUIElement) -> Bool {

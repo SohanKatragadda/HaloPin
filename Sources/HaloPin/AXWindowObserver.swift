@@ -6,6 +6,7 @@ final class AXWindowObserver: @unchecked Sendable {
         case destroyed
         case movedOrResized
         case minimized
+        case focusedWindowChanged
     }
 
     private var observer: AXObserver?
@@ -42,6 +43,14 @@ final class AXWindowObserver: @unchecked Sendable {
             )
         }
 
+        let application = AXUIElementCreateApplication(pid)
+        AXObserverAddNotification(
+            createdObserver,
+            application,
+            kAXFocusedWindowChangedNotification as CFString,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+
         let source = AXObserverGetRunLoopSource(createdObserver)
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
@@ -62,6 +71,8 @@ final class AXWindowObserver: @unchecked Sendable {
             event = .movedOrResized
         case kAXWindowMiniaturizedNotification:
             event = .minimized
+        case kAXFocusedWindowChangedNotification:
+            event = .focusedWindowChanged
         default:
             event = nil
         }

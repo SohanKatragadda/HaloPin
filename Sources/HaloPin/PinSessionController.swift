@@ -609,7 +609,31 @@ final class PinSessionController {
         case .movedOrResized:
             guard current.state == .interactive else { return }
             scheduleInteractiveGeometryRefresh()
+        case .focusedWindowChanged:
+            reconcilePinnedWindowFocus()
         }
+    }
+
+    private func reconcilePinnedWindowFocus() {
+        guard let current = session, current.state != .handingOff else { return }
+
+        if windows.isFrontmost(current.axWindow, ownerPID: current.ownerPID) {
+            guard current.state == .passive || current.state == .becomingPassive else {
+                return
+            }
+            becomeInteractive()
+        } else {
+            guard current.state == .interactive || current.state == .becomingPassive else {
+                return
+            }
+            becomePassive()
+        }
+    }
+
+    // Internal test seam. Whole-module optimization removes it from the
+    // release executable because production code never references it.
+    func handleAXEventForTesting(_ event: AXWindowObserver.Event) {
+        handleAXEvent(event)
     }
 
     private func handleCaptureFailure(_ error: Error) {
@@ -682,9 +706,7 @@ final class PinSessionController {
         case let .ownerDeactivated(pid) where pid == session?.ownerPID:
             becomePassive()
         case let .applicationActivated(pid) where pid == session?.ownerPID:
-            if session?.state != .handingOff {
-                becomeInteractive()
-            }
+            reconcilePinnedWindowFocus()
         case let .applicationTerminated(pid) where pid == session?.ownerPID:
             unpin(reason: .sourceClosed)
         case let .applicationHidden(pid) where pid == session?.ownerPID:

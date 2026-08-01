@@ -3,8 +3,6 @@
 - HaloPin supports one window at a time.
 - The first click on passive preview content only activates the source. It is
   intentionally not replayed.
-- The preview remains hidden while any window from the source application is
-  active; intra-application focus changes are not tracked in version 1.
 - Cross-Space and fullscreen-auxiliary preview placement is best effort.
   HaloPin cannot publicly move another application’s window between Spaces.
   Applications that stop rendering while off-Space show a preserved frame

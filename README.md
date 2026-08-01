@@ -6,9 +6,10 @@ Integrity Protection.
 
 It uses a deliberate two-mode design:
 
-1. While the source application is active, you interact with its real window.
-2. When that application deactivates, HaloPin shows a live, floating,
-   window-only ScreenCaptureKit preview.
+1. While the pinned source window is focused, you interact with its real
+   window.
+2. When focus moves to another window or application, HaloPin shows a live,
+   floating, window-only ScreenCaptureKit preview.
    When Spaces change, HaloPin verifies that the exact source window remains
    available. If macOS stops rendering it off-Space, HaloPin labels the
    preserved frame Paused and can guide you to assign the source application
@@ -34,7 +35,7 @@ process injection, virtual display, persistent capture, or network access.
 1. Move `HaloPin.app` to `/Applications` and open it.
 2. Grant Accessibility and Screen Recording in System Settings.
 3. Focus an eligible window and press `Control-Option-Command-P`.
-4. Switch to another application. The passive preview appears.
+4. Switch to another window or application. The passive preview appears.
 5. Click the captured content once to activate the real source window.
 6. Press the shortcut again anywhere to unpin. Intentional unpinning plays a
    distinct confirmation cue when sounds are enabled.
