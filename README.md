@@ -125,4 +125,6 @@ validates both.
 See [PRIVACY.md](PRIVACY.md), [PERMISSIONS.md](PERMISSIONS.md),
 [PERFORMANCE.md](PERFORMANCE.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md), and
 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md). Direct-download installation and
-Gatekeeper steps are in [INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md).
+Gatekeeper steps are in [INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md). The
+architecture, security boundaries, and platform compromises are documented in
+[TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).

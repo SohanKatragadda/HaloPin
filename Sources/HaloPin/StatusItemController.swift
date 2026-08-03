@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 @MainActor
 final class StatusItemController: NSObject, NSMenuDelegate {
@@ -6,6 +7,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let model: AppModel
     private weak var sessions: PinSessionController?
     private let showSettings: () -> Void
+    private var cancellables: Set<AnyCancellable> = []
 
     init(
         model: AppModel,
@@ -17,6 +19,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         self.showSettings = showSettings
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
+
+        model.$warningIndicatorMessage
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.refresh() }
+            }
+            .store(in: &cancellables)
 
         let menu = NSMenu()
         menu.delegate = self
@@ -33,6 +42,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        model.acknowledgeWarning()
         rebuildMenu(menu)
         refreshIcon()
     }
@@ -55,23 +65,40 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func refreshIcon() {
         let symbolName: String
-        switch model.presentationState {
-        case .idle:
-            symbolName = "pin"
-        case .resolving:
-            symbolName = "ellipsis.circle"
-        case .interactive:
-            symbolName = "pin.fill"
-        case .passive:
-            symbolName = "pin.circle.fill"
-        case .warning:
+        if model.warningIndicatorMessage != nil {
             symbolName = "exclamationmark.triangle.fill"
+        } else {
+            symbolName = standardSymbolName
         }
         statusItem.button?.image = NSImage(
             systemSymbolName: symbolName,
             accessibilityDescription: "HaloPin"
         )
         statusItem.button?.toolTip = "HaloPin"
+    }
+
+    private var standardSymbolName: String {
+        switch model.presentationState {
+        case .idle:
+            return "pin"
+        case .resolving:
+            return "ellipsis.circle"
+        case .interactive:
+            return "pin.fill"
+        case .passive:
+            return "pin.circle.fill"
+        case .warning:
+            switch sessions?.session?.state {
+            case .resolving:
+                return "ellipsis.circle"
+            case .interactive:
+                return "pin.fill"
+            case .becomingPassive, .passive, .handingOff:
+                return "pin.circle.fill"
+            default:
+                return "pin"
+            }
+        }
     }
 
     private func rebuildMenu(_ menu: NSMenu) {

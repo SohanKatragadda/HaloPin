@@ -12,7 +12,15 @@ final class AppModel: ObservableObject {
         case warning(String)
     }
 
-    @Published var presentationState: PresentationState = .idle
+    @Published var presentationState: PresentationState = .idle {
+        didSet {
+            guard case .warning = presentationState else {
+                acknowledgeWarning()
+                return
+            }
+        }
+    }
+    @Published private(set) var warningIndicatorMessage: String?
     @Published var pinnedWindowName: String?
     @Published var shortcutError: String?
     @Published var permissionsRevision = 0
@@ -39,9 +47,15 @@ final class AppModel: ObservableObject {
     }
 
     private let defaults: UserDefaults
+    private let warningIndicatorDuration: Duration
+    private var warningIndicatorTask: Task<Void, Never>?
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        warningIndicatorDuration: Duration = .seconds(600)
+    ) {
         self.defaults = defaults
+        self.warningIndicatorDuration = warningIndicatorDuration
         soundEnabled = defaults.object(forKey: Keys.soundEnabled) as? Bool ?? true
         haloEnabled = defaults.object(forKey: Keys.haloEnabled) as? Bool ?? true
         nativeGeometrySyncEnabled =
@@ -51,7 +65,29 @@ final class AppModel: ObservableObject {
 
     func show(error: Error) {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        showWarning(message)
+    }
+
+    func showWarning(_ message: String) {
         presentationState = .warning(message)
+        warningIndicatorMessage = message
+        warningIndicatorTask?.cancel()
+        let duration = warningIndicatorDuration
+        warningIndicatorTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.acknowledgeWarning()
+        }
+    }
+
+    func acknowledgeWarning() {
+        warningIndicatorTask?.cancel()
+        warningIndicatorTask = nil
+        warningIndicatorMessage = nil
     }
 
     func clearSession() {

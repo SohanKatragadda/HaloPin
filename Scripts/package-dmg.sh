@@ -43,6 +43,7 @@ fi
 /bin/mkdir -p "${DOCUMENTATION_DIR}"
 for document in \
     INSTALLATION_GUIDE.md \
+    TECHNICAL_REPORT.md \
     README.md \
     PERFORMANCE.md \
     PRIVACY.md \

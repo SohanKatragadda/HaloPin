@@ -648,7 +648,7 @@ final class PinSessionController {
             return
         }
         preview.setPaused(true)
-        model.presentationState = .warning(PinFailure.captureFailed.localizedDescription)
+        model.showWarning(PinFailure.captureFailed.localizedDescription)
         onMenuNeedsUpdate?()
         if session?.state == .passive, spaceRecoveryTask == nil {
             scheduleSpaceRecovery(after: .zero)
@@ -854,7 +854,7 @@ final class PinSessionController {
             logCaptureError("Space capture recovery failed", error: error)
             updateCrossSpaceState(.live)
             preview.setPaused(true)
-            model.presentationState = .warning(
+            model.showWarning(
                 PinFailure.captureFailed.localizedDescription
             )
             feedback.showHUD("Live preview paused after switching Spaces.")
@@ -908,7 +908,7 @@ final class PinSessionController {
             model.presentationState =
                 current.state == .interactive ? .interactive : .passive
         case .offSpaceAwaitingChoice, .pausedOffSpace:
-            model.presentationState = .warning(
+            model.showWarning(
                 "Source is off Desktop; preview paused."
             )
         }

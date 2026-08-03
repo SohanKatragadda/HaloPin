@@ -84,4 +84,6 @@ both permissions are granted.
 - Protected or DRM content is intentionally unsupported.
 
 For additional help, see `TROUBLESHOOTING.md`, `PERMISSIONS.md`, and
-`KNOWN_LIMITATIONS.md` in the **Installation Guide and Docs** folder.
+`KNOWN_LIMITATIONS.md` in the **Installation Guide and Docs** folder. For the
+implementation architecture and macOS security compromises, see
+`TECHNICAL_REPORT.md`.
